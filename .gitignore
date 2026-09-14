@@ -33,3 +33,9 @@ gradle-app.setting
 
 # Cache of project
 .gradletasknamecache
+
+### Radio Keystore ###
+# Never commit the actual key database.
+keystore/*.db
+keystore/__pycache__/
+keystore/.venv/

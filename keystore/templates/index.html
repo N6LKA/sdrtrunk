@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Systems</h2>
+<table>
+  <tr><th>Protocol</th><th>Label</th><th>Identifier</th></tr>
+  {% for s in systems %}
+  <tr>
+    <td>{{ s['protocol'] }}</td>
+    <td><a href="{{ url_for('view_system', system_id=s['id']) }}">{{ s['label'] }}</a></td>
+    <td>{{ s['identifier'] or '' }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="3"><em>No systems yet — add one below.</em></td></tr>
+  {% endfor %}
+</table>
+
+<fieldset>
+  <legend>Add System</legend>
+  <form method="post" action="{{ url_for('add_system') }}">
+    <label>Protocol
+      <select name="protocol" required>
+        <option value="P25">P25</option>
+        <option value="DMR">DMR</option>
+        <option value="NXDN">NXDN</option>
+      </select>
+    </label>
+    <label>Label <input name="label" required placeholder="e.g. SB Co CONFIRE P25"></label>
+    <label>Identifier <input name="identifier" placeholder="P25: WACN/SYSID hex, DMR: network name, NXDN: RAN"></label>
+    <label>Notes <textarea name="notes"></textarea></label>
+    <button type="submit">Add System</button>
+  </form>
+</fieldset>
+{% endblock %}

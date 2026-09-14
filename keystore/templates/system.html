@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block content %}
+<p><a href="{{ url_for('index') }}">&larr; All systems</a></p>
+<h2>{{ system['label'] }} <small>({{ system['protocol'] }})</small></h2>
+<p>{{ system['identifier'] or '' }}</p>
+{% if system['notes'] %}<p>{{ system['notes'] }}</p>{% endif %}
+
+<h3>Keys</h3>
+<table>
+  <tr><th>Algorithm</th><th>Key ID</th><th>Length</th><th>Label</th><th>Status</th><th></th></tr>
+  {% for k in keys %}
+  <tr class="{{ 'retired' if not k['active'] else '' }}">
+    <td>{{ k['algorithm_name'] }}</td>
+    <td>{{ k['key_id'] }}</td>
+    <td>{{ k['key_length_bits'] }} bit</td>
+    <td>{{ k['label'] or '' }}</td>
+    <td>{{ 'active' if k['active'] else 'retired' }}</td>
+    <td>
+      {% if k['active'] %}
+      <form class="inline" method="post" action="{{ url_for('deactivate_key', key_id=k['id']) }}">
+        <button type="submit">Retire</button>
+      </form>
+      {% endif %}
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="6"><em>No keys yet.</em></td></tr>
+  {% endfor %}
+</table>
+
+<fieldset>
+  <legend>Add / Rotate Key</legend>
+  <form method="post" action="{{ url_for('add_key', system_id=system['id']) }}">
+    <label>Algorithm
+      <select name="algorithm_id" required>
+        {% for value, name in algorithms %}
+        <option value="{{ value }}">{{ name }} (0x{{ '%02X' % value }})</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Key ID (over-the-air) <input name="key_id" type="number" required></label>
+    <label>Key value (hex) <input name="key_value_hex" required pattern="[0-9a-fA-F]+"></label>
+    <label>Label <input name="label" placeholder="e.g. Work primary, Test key #2"></label>
+    <button type="submit">Save Key</button>
+  </form>
+  <p><small>Adding a key with the same Algorithm + Key ID as an existing active key retires the old one and activates the new one (rotation), preserving history.</small></p>
+</fieldset>
+{% endblock %}
