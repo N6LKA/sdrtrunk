@@ -55,11 +55,26 @@ or a 404 with `{"found": false}` if no active key matches.
 - **Keystore app**: done, deployed, live-tested (systemd service, key
   entry/rotation, San Manuel DMR RC4 key verified end to end).
 - **Java HTTP client**: `io.github.dsheirer.keystore.KeystoreClient` calls
-  `/api/keys/lookup` and returns raw key bytes. Not yet wired into any
-  decoder module - nothing calls it yet.
-- **Decrypt engine**: blocked on a real architectural finding, not yet
-  started. See "Why decrypt isn't just XOR-the-frame" below before
-  attempting `P25P1AudioModule` / `P25P2AudioModule` / `DMRAudioModule`.
+  `/api/keys/lookup` and returns raw key bytes. Wired into `DMRAudioModule`
+  (see below); not yet wired into `P25P1AudioModule`/`P25P2AudioModule`.
+- **DMR RC4 decrypt engine (algorithm 0x21, DMRA Enhanced Privacy)**: written
+  and wired into `DMRAudioModule`. Core codec logic
+  (`AmbeFrameCodec`/`DmrRc4Decryptor`) is rigorously verified against the
+  real, unmodified JMBE `AMBEFrame` class as an oracle - see
+  `verification/dmr-rc4/README.md` for the full methodology and results
+  (tens of thousands of trials, 0 failures). **Not yet verified against
+  real over-the-air encrypted audio** - no captured RF sample was available
+  to test against. The full project wouldn't compile in the sandbox this
+  was written in (unrelated pre-existing JavaFX toolchain gap - confirmed
+  by checking: the *original*, untouched `DMRAudioModule.java` hits the
+  identical wall in that environment, so it's not something introduced
+  here) - a real build on a proper dev machine is the next step before any
+  live test.
+- **P25 (DES-OFB / AES-256-OFB) decrypt engine**: not started. Same overall
+  approach should apply (JMBE's IMBE codec has the same FEC-decode-then-
+  encrypt-then-transmit structure), but P25's own FEC/interleaving scheme
+  needs its own investigation - don't assume it's a copy-paste of the DMR
+  AMBE work.
 
 ### Why decrypt isn't just XOR-the-frame
 

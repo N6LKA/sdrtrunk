@@ -30,14 +30,17 @@ import io.github.dsheirer.identifier.tone.Tone;
 import io.github.dsheirer.identifier.tone.ToneIdentifier;
 import io.github.dsheirer.identifier.tone.ToneIdentifierMessage;
 import io.github.dsheirer.identifier.tone.ToneSequence;
+import io.github.dsheirer.keystore.KeystoreClient;
 import io.github.dsheirer.message.IMessage;
 import io.github.dsheirer.message.IMessageProvider;
+import io.github.dsheirer.module.decode.dmr.audio.crypto.DmrRc4Decryptor;
 import io.github.dsheirer.module.decode.dmr.identifier.DMRToneIdentifier;
 import io.github.dsheirer.module.decode.dmr.message.data.header.PiHeader;
 import io.github.dsheirer.module.decode.dmr.message.data.header.VoiceHeader;
 import io.github.dsheirer.module.decode.dmr.message.data.lc.full.AbstractVoiceChannelUser;
 import io.github.dsheirer.module.decode.dmr.message.data.lc.full.EncryptionParameters;
 import io.github.dsheirer.module.decode.dmr.message.data.terminator.Terminator;
+import io.github.dsheirer.module.decode.dmr.message.type.EncryptionAlgorithm;
 import io.github.dsheirer.module.decode.dmr.message.voice.VoiceEMBMessage;
 import io.github.dsheirer.module.decode.dmr.message.voice.VoiceMessage;
 import io.github.dsheirer.module.decode.dmr.message.voice.embedded.EmbeddedEncryptionParameters;
@@ -47,6 +50,7 @@ import io.github.dsheirer.sample.Listener;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import jmbe.iface.IAudioWithMetadata;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -64,6 +68,9 @@ public class DMRAudioModule extends AmbeAudioModule implements IdentifierUpdateP
     private boolean mEncryptedCallStateEstablished = false;
     private boolean mEncryptedCall = false;
     private Listener<IMessage> mMessageListener;
+    private final AliasList mChannelAliasList;
+    private final KeystoreClient mKeystoreClient = new KeystoreClient();
+    private DmrRc4Decryptor mRc4Decryptor;
 
     /**
      * Constructs an instance
@@ -74,6 +81,7 @@ public class DMRAudioModule extends AmbeAudioModule implements IdentifierUpdateP
     public DMRAudioModule(UserPreferences userPreferences, AliasList aliasList, int timeslot)
     {
         super(userPreferences, aliasList, timeslot);
+        mChannelAliasList = aliasList;
     }
 
     @Override
@@ -90,6 +98,7 @@ public class DMRAudioModule extends AmbeAudioModule implements IdentifierUpdateP
 
         mEncryptedCall = false;
         mEncryptedCallStateEstablished = false;
+        mRc4Decryptor = null;
         mQueuedAmbeFrames.clear();
     }
 
@@ -141,6 +150,7 @@ public class DMRAudioModule extends AmbeAudioModule implements IdentifierUpdateP
                 {
                     mEncryptedCallStateEstablished = true;
                     mEncryptedCall = true;
+                    mRc4Decryptor = createDecryptorIfPossible(ep);
                 }
                 //Note: the DMRMessageProcessor extracts Full Link Control messages from Voice Frames B-C and sends them
                 // independent of any DMR Burst messaging.  When encountered, it can be assumed that they are part of
@@ -151,7 +161,12 @@ public class DMRAudioModule extends AmbeAudioModule implements IdentifierUpdateP
                     mEncryptedCall = avcu.getServiceOptions().isEncrypted();
                 }
 
-                if(mEncryptedCall)
+                //Only the PiHeader/EncryptionParameters branch above carries the algorithm, key ID, and
+                //initialization vector needed to decrypt - none of the other paths that can establish
+                //mEncryptedCall (short burst embedded params, service options flags) carry an IV, so a
+                //decryptor can never be built from them alone. If this call's encrypted state was
+                //established some other way, mRc4Decryptor stays null and frames get dropped as before.
+                if(mEncryptedCall && mRc4Decryptor == null)
                 {
                     mQueuedAmbeFrames.clear();
                 }
@@ -161,17 +176,9 @@ public class DMRAudioModule extends AmbeAudioModule implements IdentifierUpdateP
             //before any audio is generated for the audio segment.
             if(message instanceof VoiceMessage voiceMessage)
             {
-                if(mEncryptedCallStateEstablished && mEncryptedCall)
+                for(byte[] frame: voiceMessage.getAMBEFrames())
                 {
-                    mQueuedAmbeFrames.clear();
-                }
-                else
-                {
-                    List<byte[]> frames = voiceMessage.getAMBEFrames();
-                    for(byte[] frame: frames)
-                    {
-                        processAudio(frame, message.getTimestamp());
-                    }
+                    processAudio(frame, message.getTimestamp());
                 }
             }
             else if(message instanceof Terminator)
@@ -182,14 +189,56 @@ public class DMRAudioModule extends AmbeAudioModule implements IdentifierUpdateP
     }
 
     /**
+     * Attempts to build an RC4 decryptor for the current call from this call's PI Header encryption
+     * parameters, by looking up the static key from the Radio Keystore (keystore/ in this repo). Returns
+     * null (meaning: fall back to dropping encrypted audio, same as always) if the algorithm isn't DMRA
+     * RC4 (0x21 - this class doesn't implement Hytera's incompatible RC4 variant), if this channel's
+     * alias list isn't named to match a keystore system identifier, or if no active key is found there.
+     */
+    private DmrRc4Decryptor createDecryptorIfPossible(EncryptionParameters encryptionParameters)
+    {
+        if(encryptionParameters.getAlgorithm() != EncryptionAlgorithm.DMRA_RC4)
+        {
+            return null;
+        }
+
+        //AliasList.hasName() is private, so replicate its check here (non-null, non-empty name).
+        if(mChannelAliasList == null || mChannelAliasList.getName() == null || mChannelAliasList.getName().isEmpty())
+        {
+            return null;
+        }
+
+        try
+        {
+            Optional<byte[]> keyBytes = mKeystoreClient.lookupKey("DMR", mChannelAliasList.getName(),
+                EncryptionAlgorithm.DMRA_RC4.getValue(), encryptionParameters.getKeyId());
+
+            if(keyBytes.isEmpty() || keyBytes.get().length != 5)
+            {
+                return null;
+            }
+
+            int iv = (int)Long.parseLong(encryptionParameters.getInitializationVector(), 16);
+            return new DmrRc4Decryptor(keyBytes.get(), iv);
+        }
+        catch(Exception e)
+        {
+            mLog.error("Error building DMR RC4 decryptor - encrypted audio will be dropped for this call ["
+                + e.getMessage() + "]");
+            return null;
+        }
+    }
+
+    /**
      * Processes the audio frame.  Queues the frame until encryption state is determined.  Once determined, the audio
-     * frames are dequeued and audio is generated.
+     * frames are dequeued and audio is generated - decrypted first, if this call is encrypted and a decryptor is
+     * available for it.
      */
     private void processAudio(byte[] frame, long timestamp)
     {
         if(mEncryptedCallStateEstablished)
         {
-            if(mEncryptedCall)
+            if(mEncryptedCall && mRc4Decryptor == null)
             {
                 mQueuedAmbeFrames.clear();
             }
@@ -198,25 +247,44 @@ public class DMRAudioModule extends AmbeAudioModule implements IdentifierUpdateP
                 //Process any ambe frames that were queued awaiting encryption state determination
                 if(!mQueuedAmbeFrames.isEmpty())
                 {
-                    if(!mEncryptedCall)
+                    for(byte[] queuedFrame: mQueuedAmbeFrames)
                     {
-                        for(byte[] queuedFrame: mQueuedAmbeFrames)
-                        {
-                            produceAudio(queuedFrame, timestamp);
-                        }
-
-                        mQueuedAmbeFrames.clear();
+                        produceDecryptedAudio(queuedFrame, timestamp);
                     }
 
                     mQueuedAmbeFrames.clear();
                 }
 
-                produceAudio(frame, timestamp);
+                produceDecryptedAudio(frame, timestamp);
             }
         }
         else
         {
             mQueuedAmbeFrames.add(frame);
+        }
+    }
+
+    /**
+     * Decrypts the frame first, if this call is encrypted and a decryptor is available - otherwise produces
+     * audio directly, same as an unencrypted call. On a decrypt failure, logs and skips producing audio for
+     * just that one frame rather than risk feeding raw encrypted bytes into the vocoder.
+     */
+    private void produceDecryptedAudio(byte[] frame, long timestamp)
+    {
+        if(mEncryptedCall && mRc4Decryptor != null)
+        {
+            try
+            {
+                produceAudio(mRc4Decryptor.decryptFrame(frame), timestamp);
+            }
+            catch(Exception e)
+            {
+                mLog.error("Error decrypting DMR RC4 voice frame - skipping this frame [" + e.getMessage() + "]");
+            }
+        }
+        else
+        {
+            produceAudio(frame, timestamp);
         }
     }
 
