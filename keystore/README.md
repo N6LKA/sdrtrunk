@@ -30,6 +30,19 @@ checkout at all, even if overridden — fail loud rather than risk it. Put the
 web UI behind your normal LAN auth (e.g. Authelia) rather than exposing it
 publicly.
 
+## Running as a service
+
+`sdrtrunk-keystore.service` assumes the checkout lives at `/opt/sdrtrunk-src`
+and runs as user `n6lka` with a venv at `keystore/venv` — adjust paths/user
+if yours differ.
+
+    sudo cp sdrtrunk-keystore.service /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now sdrtrunk-keystore
+
+    # logs
+    journalctl -u sdrtrunk-keystore -f
+
 ## JSON API (used by SDRTrunk)
 
 `GET /api/keys/lookup?protocol=P25&identifier=<system identifier>&algorithm_id=<int>&key_id=<int>`
