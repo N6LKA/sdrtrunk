@@ -16,15 +16,19 @@ decrypt time.
     pip install -r requirements.txt
     python server.py
 
-| Variable         | Default                   | Purpose                                                        |
-|------------------|----------------------------|-----------------------------------------------------------------|
-| KEYSTORE_DB_PATH | /opt/sdrtrunk/keystore.db | Path to the SQLite database. Created on first run.              |
-| KEYSTORE_HOST    | 0.0.0.0                   | Bind address for the web UI / API                                |
-| KEYSTORE_PORT    | 5901                       | Bind port                                                        |
+| Variable         | Default                                | Purpose                                             |
+|------------------|------------------------------------------|-------------------------------------------------------|
+| KEYSTORE_DB_PATH | /var/lib/sdrtrunk-keystore/keystore.db | Path to the SQLite database. Created on first run.   |
+| KEYSTORE_HOST    | 0.0.0.0                                | Bind address for the web UI / API                     |
+| KEYSTORE_PORT    | 5901                                    | Bind port                                             |
 
-The database holds real decryption key material. It is created outside the
-repo checkout and is never committed — put the web UI behind your normal LAN
-auth (e.g. Authelia) rather than exposing it publicly.
+The database holds real decryption key material. The default path lives
+under `/var/lib`, deliberately outside any location you'd plausibly clone
+this repo into, so a fresh checkout or `git clean` can never touch it. The
+app refuses to start if `KEYSTORE_DB_PATH` is pointed inside the repo
+checkout at all, even if overridden — fail loud rather than risk it. Put the
+web UI behind your normal LAN auth (e.g. Authelia) rather than exposing it
+publicly.
 
 ## JSON API (used by SDRTrunk)
 

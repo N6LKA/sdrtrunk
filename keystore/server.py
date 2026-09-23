@@ -12,8 +12,29 @@ from pathlib import Path
 from flask import Flask, abort, g, jsonify, redirect, render_template, request, url_for
 
 APP_DIR = Path(__file__).resolve().parent
+REPO_ROOT = APP_DIR.parent
 SCHEMA_PATH = APP_DIR / "schema.sql"
-DB_PATH = Path(os.environ.get("KEYSTORE_DB_PATH", "/opt/sdrtrunk/keystore.db"))
+
+# Default lives under /var/lib, a location nobody clones a git repo into, so
+# it can never collide with wherever this checkout happens to sit. Override
+# with KEYSTORE_DB_PATH if you want it somewhere else.
+DEFAULT_DB_PATH = "/var/lib/sdrtrunk-keystore/keystore.db"
+
+
+def _resolve_db_path() -> Path:
+    path = Path(os.environ.get("KEYSTORE_DB_PATH", DEFAULT_DB_PATH)).expanduser().resolve()
+    repo_root_resolved = str(REPO_ROOT.resolve())
+    if str(path) == repo_root_resolved or str(path).startswith(repo_root_resolved + os.sep):
+        raise SystemExit(
+            f"KEYSTORE_DB_PATH ({path}) is inside the git checkout ({repo_root_resolved}).\n"
+            "That risks the key database being touched by git operations (checkout, clean, reset).\n"
+            "Point KEYSTORE_DB_PATH at a location outside the repo, "
+            "e.g. /var/lib/sdrtrunk-keystore/keystore.db"
+        )
+    return path
+
+
+DB_PATH = _resolve_db_path()
 
 # Algorithm ID -> name, per protocol. Mirrors the enums SDRTrunk itself parses
 # (io.github.dsheirer.module.decode.p25.reference.Encryption,
