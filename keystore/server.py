@@ -85,6 +85,28 @@ ALGORITHMS = {
     ],
 }
 
+# Expected key length in hex characters, for algorithms with a well-known
+# fixed key width. Sourced from DSD-FME's documented key formats
+# (github.com/lwvmobile/dsd-fme, dsd_main.c CLI help + crypt-rc4.c), which
+# confirm DMR RC4/Hytera BP keys are a 40-bit (10 hex char) value, plus the
+# standard textbook widths for DES/AES. Keys shorter than the expected width
+# are zero-padded on the left (e.g. "777" -> "0000000777" for RC4); keys
+# longer than expected are rejected as a likely data-entry mistake.
+# Algorithms not listed here have no known-fixed width and are left
+# unvalidated rather than guessed.
+EXPECTED_HEX_CHARS = {
+    ("DMR", 0x01): 10,  # Hytera Basic Privacy
+    ("DMR", 0x02): 10,  # Hytera RC4/Enhanced Privacy
+    ("DMR", 0x21): 10,  # DMRA RC4/Enhanced Privacy
+    ("DMR", 0x24): 32,  # DMRA AES-128
+    ("DMR", 0x25): 64,  # DMRA AES-256
+    ("DMR", 0x26): 10,  # Hytera RC4/Enhanced Privacy (v2)
+    ("P25", 0x81): 16,  # DES-OFB
+    ("P25", 0x84): 64,  # AES-256
+    ("P25", 0x85): 32,  # AES-128
+    ("P25", 0x89): 32,  # AES-128-OFB
+}
+
 
 def get_db():
     if "db" not in g:
@@ -135,6 +157,37 @@ def create_app():
         db.commit()
         return redirect(url_for("index"))
 
+    @app.route("/systems/<int:system_id>/edit", methods=["GET", "POST"])
+    def edit_system(system_id):
+        db = get_db()
+        system = db.execute("SELECT * FROM systems WHERE id = ?", (system_id,)).fetchone()
+        if system is None:
+            abort(404)
+
+        if request.method == "POST":
+            db.execute(
+                "UPDATE systems SET protocol = ?, label = ?, identifier = ?, notes = ? WHERE id = ?",
+                (
+                    request.form["protocol"],
+                    request.form["label"],
+                    request.form.get("identifier") or None,
+                    request.form.get("notes") or None,
+                    system_id,
+                ),
+            )
+            db.commit()
+            return redirect(url_for("view_system", system_id=system_id))
+
+        return render_template("edit_system.html", system=system)
+
+    @app.route("/systems/<int:system_id>/delete", methods=["POST"])
+    def delete_system(system_id):
+        db = get_db()
+        # ON DELETE CASCADE in schema.sql removes this system's keys too.
+        db.execute("DELETE FROM systems WHERE id = ?", (system_id,))
+        db.commit()
+        return redirect(url_for("index"))
+
     @app.route("/systems/<int:system_id>")
     def view_system(system_id):
         db = get_db()
@@ -163,6 +216,19 @@ def create_app():
 
         if not key_value_hex or any(c not in "0123456789abcdef" for c in key_value_hex):
             abort(400, "Key value must be hex")
+
+        expected_chars = EXPECTED_HEX_CHARS.get((system["protocol"], algorithm_id))
+        if expected_chars is not None:
+            if len(key_value_hex) > expected_chars:
+                abort(
+                    400,
+                    f"{algorithm_name} keys are {expected_chars} hex characters "
+                    f"({expected_chars * 4}-bit) - got {len(key_value_hex)}, that's too long",
+                )
+            key_value_hex = key_value_hex.zfill(expected_chars)
+        elif len(key_value_hex) % 2 != 0:
+            # No known fixed width - just pad to a whole number of bytes.
+            key_value_hex = "0" + key_value_hex
 
         # Rotation: retire any existing active key for this system+algorithm+key_id
         db.execute(
