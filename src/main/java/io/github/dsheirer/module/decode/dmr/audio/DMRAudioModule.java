@@ -44,6 +44,7 @@ import io.github.dsheirer.module.decode.dmr.message.type.EncryptionAlgorithm;
 import io.github.dsheirer.module.decode.dmr.message.voice.VoiceEMBMessage;
 import io.github.dsheirer.module.decode.dmr.message.voice.VoiceMessage;
 import io.github.dsheirer.module.decode.dmr.message.voice.embedded.EmbeddedEncryptionParameters;
+import io.github.dsheirer.module.decode.dmr.message.voice.embedded.EmbeddedParameters;
 import io.github.dsheirer.preference.UserPreferences;
 import io.github.dsheirer.protocol.Protocol;
 import io.github.dsheirer.sample.Listener;
@@ -161,19 +162,24 @@ public class DMRAudioModule extends AmbeAudioModule implements IdentifierUpdateP
                     mEncryptedCall = avcu.getServiceOptions().isEncrypted();
                 }
 
-                //Only the PiHeader/EncryptionParameters branch above carries the algorithm, key ID, and
-                //initialization vector needed to decrypt - none of the other paths that can establish
-                //mEncryptedCall (short burst embedded params, service options flags) carry an IV, so a
-                //decryptor can never be built from them alone. If this call's encrypted state was
-                //established some other way, mRc4Decryptor stays null and frames get dropped as before.
+                //The PiHeader/EncryptionParameters branch above carries the algorithm, key ID, and IV needed to
+                //decrypt immediately. The other paths that can establish mEncryptedCall (short burst embedded
+                //params, service options flags) don't carry an IV directly - but DMR has a built-in late-entry
+                //mechanism (see the IV-upgrade check below) that reconstructs the IV from fragments spread
+                //across a full 6-frame superframe cycle, arriving later. Until then, mRc4Decryptor stays null
+                //and frames get dropped, same as always.
                 if(mEncryptedCall && mRc4Decryptor == null)
                 {
                     mQueuedAmbeFrames.clear();
                 }
             }
 
-            //Queue or process audio frames.  Note: audio frames are held/queued until encrypted state is established
-            //before any audio is generated for the audio segment.
+            //Queue or process audio frames FIRST, using whichever decryptor is currently active - this frame
+            //(frame F, if this is a VoiceEMBMessage with a freshly-completed IV) was encrypted with the PREVIOUS
+            //superframe's key, not the one its own fragments just revealed. DSD-FME confirms this ordering:
+            //dmr_bs.c decrypts/decodes frame 6's AMBE content BEFORE calling dmr_alg_refresh() ("run alg refresh
+            //after vc6 ambe processing") - the refresh sets up the key for the NEXT superframe, applied only to
+            //frames received afterward.
             if(message instanceof VoiceMessage voiceMessage)
             {
                 for(byte[] frame: voiceMessage.getAMBEFrames())
@@ -185,19 +191,80 @@ public class DMRAudioModule extends AmbeAudioModule implements IdentifierUpdateP
             {
                 reset();
             }
+
+            //DMR RC4 (DSD-FME dmr_alg_refresh(), dmr_le.c) re-derives the MI and resets the keystream drop
+            //offset EVERY superframe cycle (every 6 frames, at frame F) - the MI is NOT a single fixed value
+            //for the whole call, it's fresh per superframe. This runs AFTER this frame's own audio has already
+            //been processed (above) with the previous decryptor, so the freshly-reconstructed key/IV only takes
+            //effect starting with the next superframe's frames, matching DSD-FME's ordering. If a given
+            //superframe's IV fails to reconstruct (Golay/CRC failure), there's no valid key material for the
+            //next superframe's frames, so the decryptor is cleared (frames dropped) rather than reusing a
+            //decryptor built from a previous, now-stale superframe's MI, which would just produce different
+            //garbage.
+            if(mEncryptedCall && message instanceof VoiceEMBMessage voiceEmb)
+            {
+                EmbeddedParameters embeddedParameters = voiceEmb.hasEmbeddedParameters() ? voiceEmb.getEmbeddedParameters() : null;
+
+                if(embeddedParameters != null && embeddedParameters.hasIv())
+                {
+                    mRc4Decryptor = createDecryptorFromEmbeddedParameters(voiceEmb);
+                }
+            }
         }
     }
 
     /**
      * Attempts to build an RC4 decryptor for the current call from this call's PI Header encryption
-     * parameters, by looking up the static key from the Radio Keystore (keystore/ in this repo). Returns
-     * null (meaning: fall back to dropping encrypted audio, same as always) if the algorithm isn't DMRA
-     * RC4 (0x21 - this class doesn't implement Hytera's incompatible RC4 variant), if this channel's
-     * alias list isn't named to match a keystore system identifier, or if no active key is found there.
+     * parameters, by looking up the static key from the Radio Keystore (keystore/ in this repo).
      */
     private DmrRc4Decryptor createDecryptorIfPossible(EncryptionParameters encryptionParameters)
     {
-        if(encryptionParameters.getAlgorithm() != EncryptionAlgorithm.DMRA_RC4)
+        return createDecryptorIfPossible(encryptionParameters.getAlgorithm(), encryptionParameters.getKeyId(),
+            encryptionParameters.getInitializationVector());
+    }
+
+    /**
+     * Attempts to build a decryptor from a voice frame's embedded parameters - specifically the IV that DMR
+     * reconstructs from fragments spread across a full 6-frame (A-F) superframe cycle, for late-entry calls
+     * that never showed us the call's original PI Header (confirmed via live testing on a real system: this
+     * is the NORMAL case for an always-on fixed-frequency channel, not a rare edge case - the PI Header may
+     * never be seen at all if we're already listening when a call starts, or every call genuinely establishes
+     * encryption state via VoiceHeader/service-options first). Returns null if this specific frame doesn't
+     * carry a complete algorithm+key+IV set - most won't; only frame F does, and only once a full A-E
+     * fragment set has actually been collected (see VoiceSuperFrameProcessor.isComplete()).
+     */
+    private DmrRc4Decryptor createDecryptorFromEmbeddedParameters(VoiceEMBMessage voice)
+    {
+        if(!voice.hasEmbeddedParameters())
+        {
+            return null;
+        }
+
+        EmbeddedParameters embeddedParameters = voice.getEmbeddedParameters();
+
+        if(!(embeddedParameters.getShortBurst() instanceof EmbeddedEncryptionParameters eep))
+        {
+            return null;
+        }
+
+        if(!embeddedParameters.hasIv())
+        {
+            return null;
+        }
+
+        return createDecryptorIfPossible(eep.getAlgorithm(), eep.getKey(), embeddedParameters.getIv());
+    }
+
+    /**
+     * Attempts to build an RC4 decryptor from the given algorithm/key ID/IV, by looking up the static key
+     * from the Radio Keystore (keystore/ in this repo). Returns null (meaning: fall back to dropping
+     * encrypted audio, same as always) if the algorithm isn't DMRA RC4 (0x21 - this class doesn't implement
+     * Hytera's incompatible RC4 variant), if this channel's alias list isn't named to match a keystore
+     * system identifier, or if no active key is found there.
+     */
+    private DmrRc4Decryptor createDecryptorIfPossible(EncryptionAlgorithm algorithm, int keyId, String ivHex)
+    {
+        if(algorithm != EncryptionAlgorithm.DMRA_RC4)
         {
             return null;
         }
@@ -211,20 +278,27 @@ public class DMRAudioModule extends AmbeAudioModule implements IdentifierUpdateP
         try
         {
             Optional<byte[]> keyBytes = mKeystoreClient.lookupKey("DMR", mChannelAliasList.getName(),
-                EncryptionAlgorithm.DMRA_RC4.getValue(), encryptionParameters.getKeyId());
+                EncryptionAlgorithm.DMRA_RC4.getValue(), keyId);
 
             if(keyBytes.isEmpty() || keyBytes.get().length != 5)
             {
                 return null;
             }
 
-            int iv = (int)Long.parseLong(encryptionParameters.getInitializationVector(), 16);
+            int iv = (int)Long.parseLong(ivHex, 16);
             return new DmrRc4Decryptor(keyBytes.get(), iv);
+        }
+        catch(NumberFormatException e)
+        {
+            //Expected/routine: the late-entry IV reconstruction (VoiceSuperFrameProcessor) appends a
+            //"(CRC-FAIL n/n/n/n)" diagnostic suffix to the hex string when its own CRC4 self-check fails,
+            //rather than returning null - this correctly rejects a bad IV, it's just not an error.
+            return null;
         }
         catch(Exception e)
         {
             mLog.error("Error building DMR RC4 decryptor - encrypted audio will be dropped for this call ["
-                + e.getMessage() + "]");
+                + e.getMessage() + "]", e);
             return null;
         }
     }
@@ -279,7 +353,7 @@ public class DMRAudioModule extends AmbeAudioModule implements IdentifierUpdateP
             }
             catch(Exception e)
             {
-                mLog.error("Error decrypting DMR RC4 voice frame - skipping this frame [" + e.getMessage() + "]");
+                mLog.error("Error decrypting DMR RC4 voice frame - skipping this frame [" + e.getMessage() + "]", e);
             }
         }
         else

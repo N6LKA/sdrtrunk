@@ -12,26 +12,26 @@ import io.github.dsheirer.module.decode.dmr.audio.crypto.jmbe.Golay24;
 import java.nio.ByteOrder;
 
 /**
- * Decodes a raw 9-byte DMR AMBE frame down to its 49-bit voice parameter
- * payload (b0..b8, flattened), and encodes that payload back into a
- * synthetic 9-byte frame - the exact inverse of jmbe.codec.ambe.AMBEFrame's
- * private decode(), needed because that decode/encode pair isn't exposed
- * anywhere in JMBE's public API.
+ * Decodes a raw 9-byte DMR AMBE frame down to its 49-bit channel-coding payload,
+ * and encodes that payload back into a synthetic 9-byte frame - the exact inverse
+ * of jmbe.codec.ambe.AMBEFrame's private decode(), needed because that decode/encode
+ * pair isn't exposed anywhere in JMBE's public API.
  *
- * The 49 bits produced by decode()/packTo49Bits() are exactly the payload
- * DMR encryption is applied to (confirmed against DSD-FME's reference
- * implementation, github.com/lwvmobile/dsd-fme). The intended use:
- * decode() -> packTo49Bits() -> XOR with RC4 keystream -> unpackFrom49Bits()
- * -> encode(), producing a frame that the existing, unmodified
- * jmbe IAudioCodec.getAudio(byte[]) call can consume normally.
+ * decodeTo49Bits()/encodeFrom49Bits() (used for RC4 decrypt - see decodeToRawVectorBits()'s
+ * javadoc for why) pack the 49 bits in raw C0/C1/C2/C3 channel-coding vector order, which is
+ * the order live cross-testing against DSD-FME (github.com/lwvmobile/dsd-fme, an independent
+ * decoder/encryption implementation) on real encrypted DMR traffic proved the actual
+ * over-the-air encryption uses.
  *
- * Correctness note: this was verified by round-tripping tens of thousands of
- * frames against the real, unmodified jmbe.codec.ambe.AMBEFrame class as an
- * oracle (encode -> real AMBEFrame decode -> compare; and decode -> compare
- * against real AMBEFrame's own output) - not just derived by inspection.
- * See the verification/ directory at the repo root to reproduce that.
- * The index arrays below are copied verbatim from AMBEFrame.java
- * (github.com/DSheirer/jmbe) to guarantee they match the real decoder.
+ * decodeToB()/encode()/packTo49Bits()/unpackFrom49Bits() pack the same 49 bits in JMBE's own
+ * b0..b8 voice-model parameter grouping instead - a reorganization JMBE does internally for
+ * vocoder-parameter convenience, verified byte-for-byte against real, unmodified
+ * jmbe.codec.ambe.AMBEFrame (20,000+ frame round-trip, see verification/ at the repo root) but
+ * NOT the bit order encryption is actually applied to. Kept for that verification value and
+ * because the b0..b8 breakdown is useful for future debugging, but not used by the decrypt path.
+ *
+ * The index arrays below are copied verbatim from AMBEFrame.java (github.com/DSheirer/jmbe) to
+ * guarantee they match the real decoder.
  */
 public class AmbeFrameCodec
 {
@@ -51,6 +51,7 @@ public class AmbeFrameCodec
     private static final int[] VECTOR_U2_B6_HIGH = {4, 5, 6};
     private static final int[] VECTOR_U2_B7_HIGH = {7, 8, 9};
     private static final int[] VECTOR_U2_B8_HIGH = {10};
+    private static final int[] VECTOR_C3_SEQUENTIAL = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
     private static final int[] VECTOR_U3_B0_LOW = {2, 3, 4};
     private static final int[] VECTOR_U3_B1_LOW = {0};
     private static final int[] VECTOR_U3_B2_LOW = {1};
@@ -86,13 +87,86 @@ public class AmbeFrameCodec
      */
     public static long decodeTo49Bits(byte[] frame9Bytes)
     {
-        return packTo49Bits(decodeToB(frame9Bytes));
+        return decodeToRawVectorBits(frame9Bytes);
     }
 
     /** Inverse of decodeTo49Bits() - encodes a 49-bit payload back to a 9-byte frame. */
     public static byte[] encodeFrom49Bits(long value49)
     {
-        return encode(unpackFrom49Bits(value49));
+        return encodeFromRawVectorBits(value49);
+    }
+
+    /**
+     * Decodes a raw 9-byte AMBE frame into 49 bits, in the SAME order the raw C0/C1/C2/C3
+     * channel-coding vectors naturally hold them (U0[12 bits] || U1[12 bits, post-descramble]
+     * || C2-functional[11 bits] || C3[14 bits, natural order]) - NOT the b0..b8 voice-model
+     * parameter grouping that decodeToB()/packTo49Bits() produce.
+     * <p>
+     * Why this exists: decodeTo49Bits() originally used packTo49Bits(decodeToB(...)), which
+     * matches real JMBE's AMBEFrame.decode() perfectly (verified against 20,000+ real frames)
+     * - but that b0..b8 grouping is JMBE's OWN internal reorganization of the channel bits for
+     * vocoder-parameter convenience, not the actual over-the-air bit order. Live cross-testing
+     * against DSD-FME (a completely independent decoder/encryption implementation) on the same
+     * real encrypted DMR traffic proved the two systems' RC4 keystreams are byte-for-byte
+     * identical, but the "ciphertext" bytes differed - always as a same-bit-count permutation,
+     * never as different data - which only makes sense if decryption needs to operate on the
+     * bits in their raw, pre-reorganization vector order, since RC4 has no notion of voice
+     * parameter semantics and must be applied in the exact order the transmitter used.
+     */
+    static long decodeToRawVectorBits(byte[] frame9Bytes)
+    {
+        BinaryFrame frame = BinaryFrame.fromBytes(frame9Bytes, ByteOrder.LITTLE_ENDIAN);
+
+        BinaryFrame c0 = extractVector(frame, VECTOR_C0);
+        BinaryFrame c1 = extractVector(frame, VECTOR_C1);
+        BinaryFrame c2 = extractVector(frame, VECTOR_C2);
+        BinaryFrame c3 = extractVector(frame, VECTOR_C3);
+
+        Golay24.checkAndCorrect(c0, 0);
+        BinaryFrame modulationVector = getModulationVector(c0.getInt(VECTOR_U0));
+        c1.xor(modulationVector);
+        Golay23.checkAndCorrect(c1, 0);
+
+        long u0 = c0.getInt(VECTOR_U0) & 0xFFFL; //12 bits
+        long u1 = ((c1.getInt(VECTOR_U1_B3_HIGH) << 4) + c1.getInt(VECTOR_U1_B4_HIGH)) & 0xFFFL; //12 bits
+        long c2Functional = ((c2.getInt(VECTOR_U2_B5_HIGH) << 7) + (c2.getInt(VECTOR_U2_B6_HIGH) << 4)
+            + (c2.getInt(VECTOR_U2_B7_HIGH) << 1) + c2.getInt(VECTOR_U2_B8_HIGH)) & 0x7FFL; //11 bits
+        long c3All = c3.getInt(VECTOR_C3_SEQUENTIAL) & 0x3FFFL; //14 bits
+
+        return (u0 << 37) | (u1 << 25) | (c2Functional << 14) | c3All;
+    }
+
+    /** Inverse of decodeToRawVectorBits() - encodes a raw-vector-order 49-bit payload back to a 9-byte frame. */
+    static byte[] encodeFromRawVectorBits(long value49)
+    {
+        int u0 = (int)((value49 >>> 37) & 0xFFF);
+        int u1 = (int)((value49 >>> 25) & 0xFFF);
+        int c2Functional = (int)((value49 >>> 14) & 0x7FF);
+        int c3All = (int)(value49 & 0x3FFF);
+
+        BinaryFrame c0Local = new BinaryFrame(24);
+        setInt(c0Local, VECTOR_U0, u0);
+        golayEncode24(c0Local);
+
+        BinaryFrame c1Data = new BinaryFrame(23);
+        c1Data.load(0, 12, u1);
+        golayEncode23(c1Data);
+        BinaryFrame modulationVector = getModulationVector(c0Local.getInt(VECTOR_U0));
+        c1Data.xor(modulationVector);
+
+        BinaryFrame c2Local = new BinaryFrame(11);
+        c2Local.load(0, 11, c2Functional);
+
+        BinaryFrame c3Local = new BinaryFrame(14);
+        c3Local.load(0, 14, c3All);
+
+        BinaryFrame frame = new BinaryFrame(72);
+        copyBitsSequential(frame, VECTOR_C0, c0Local);
+        copyBitsSequential(frame, VECTOR_C1, c1Data);
+        copyBitsSequential(frame, VECTOR_C2, c2Local);
+        copyBitsSequential(frame, VECTOR_C3, c3Local);
+
+        return toBytes(frame, 9);
     }
 
     static int[] decodeToB(byte[] frame9Bytes)

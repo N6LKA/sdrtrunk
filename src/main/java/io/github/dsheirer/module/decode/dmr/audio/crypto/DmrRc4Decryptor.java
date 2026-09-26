@@ -32,8 +32,13 @@ public class DmrRc4Decryptor
 {
     private static final int FRAME_BYTES = 7; // packed AMBE payload size for keystream purposes (49 bits -> 7 bytes)
 
+    // DSD-FME (dmr_le.c, dmr_alg_refresh()) starts every new call's keystream at drop offset 256,
+    // not 0 - the first 256 RC4 keystream bytes are statistically biased and are discarded before
+    // any real data is XORed with the stream, matching this scheme's actual over-the-air convention.
+    private static final int INITIAL_DROP_OFFSET = 256;
+
     private final byte[] mKey; // 9 bytes: 5-byte static key + 4-byte MI
-    private int mDropOffset = 0;
+    private int mDropOffset = INITIAL_DROP_OFFSET;
 
     /**
      * @param staticKeyBytes the 5-byte (40-bit) key from the keystore
